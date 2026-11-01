@@ -8238,6 +8238,10 @@ def logcumsumexp(x, dim):
         if dim not in [0, -1]:
             raise AssertionError("expected: dim in [0, -1]")
         return clone(x)
+    # The generated MPS scan evaluates the combine at every shuffle level, which costs
+    # more than the memory pass fusion saves for logaddexp
+    if x.get_device().type == "mps":
+        return fallback_logcumsumexp(x, dim=dim)
 
     kwargs = _make_scan_inner(x, axis=dim, dtype=dtype)
     (result,) = ir.Scan.create(**kwargs, combine_fn=log_add_exp_helper)

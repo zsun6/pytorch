@@ -2906,7 +2906,7 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op(self):
-        if self.device != "cuda" and self.device != "xpu":
+        if self.device not in ("cuda", "xpu", "mps"):
             raise unittest.SkipTest("associative_scan only supported on GPU")
 
         def sum_combine(a, b):
@@ -2970,7 +2970,7 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op_multi_input(self):
-        if self.device != "cuda" and self.device != "xpu":
+        if self.device not in ("cuda", "xpu", "mps"):
             raise unittest.SkipTest("associative_scan only supported on GPU")
 
         def argmax_combine(a, b):
@@ -3364,6 +3364,14 @@ class CommonTemplate:
             atol=1e-5,
             rtol=1e-5,
         )
+
+    def test_cumsum_reductions_over_tail(self):
+        # 3000 is not a multiple of the block size, so a looped scan has tail lanes
+        def fn(x):
+            c = x.cumsum(-1)
+            return c.amax(-1), (-c).amin(-1), (c > 3000).any(-1), c.sum(-1), c.var(-1)
+
+        self.common(fn, (torch.ones(4, 3000),), check_lowp=False)
 
     def test_cumsum_zero_dim(self):
         def fn(x):

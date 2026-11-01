@@ -392,6 +392,73 @@ class MPSBasicTests(TestCase):
         _, (code,) = run_and_get_code(torch.compile(lambda x: x * 2), x)
         self.assertNotIn("error_buf", code)
 
+    def _check_scan(self, fn, args, dynamic=False, **kwargs):
+        torch._dynamo.reset()
+        actual, (code,) = run_and_get_code(torch.compile(fn, dynamic=dynamic), *args)
+        self.assertNotIn("torch.ops.aten.cum", code)
+        self.assertEqual(actual, fn(*args), **kwargs)
+
+    @parametrize("dynamic", [False, True])
+    def test_scan_lengths(self, dynamic):
+        # serial, partial simdgroup, partial chunk, several chunks with a tail
+        for length in (7, 33, 1000, 1025, 4000):
+            x = torch.rand(5, length, device=self.device) * 0.01 + 1
+            self._check_scan(lambda x: x.cumsum(-1) * 2, (x,), dynamic)
+            # products of thousands of floats differ from eager by a few ulps
+            self._check_scan(
+                lambda x: x.cumprod(-1) * 2, (x,), dynamic, atol=0, rtol=1e-5
+            )
+
+    def test_scan_dtypes(self):
+        # Metal has no simd shuffles for 64-bit ints (int/bool cumsum and cummax
+        # indices are int64), bool or bfloat
+        for dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.int32,
+            torch.uint8,
+            torch.bool,
+        ):
+            x = make_tensor((5, 1025), dtype=dtype, device=self.device, low=-3, high=3)
+            self._check_scan(lambda x: x.cumsum(-1) * 2, (x,))
+            if dtype.is_floating_point:
+                # ties and nans exercise the argmax combine
+                x = x.round()
+                x[0, 100] = x[3, 7] = float("nan")
+            self._check_scan(lambda x: [t * 2 for t in torch.cummax(x, -1)], (x,))
+            self._check_scan(lambda x: [t * 2 for t in torch.cummin(x, 0)], (x,))
+
+    def test_scan_and_argmax_ties(self):
+        def fn(x):
+            return x.cumsum(-1) * 2, x.argmax(-1), x.argmin(-1)
+
+        x = torch.randint(0, 3, (16, 3000), device=self.device).float()
+        self._check_scan(fn, (x,))
+
+    def test_scan_falls_back(self):
+        # Nothing to fuse, or few long rows that need a multi-threadgroup scan:
+        # the aten kernel is faster
+        x = torch.rand(64, 1000, device=self.device)
+        for fn, arg in ((torch.cumsum, x), (lambda x, d: x.cumsum(d) * 2, x.view(-1))):
+            torch._dynamo.reset()
+            _, (code,) = run_and_get_code(torch.compile(fn), arg, 0)
+            self.assertIn("torch.ops.aten.cumsum", code)
+
+    def test_associative_scan_linear_recurrence(self):
+        # h[t] = a[t] * h[t-1] + b[t], as in Mamba-style state space models
+        from torch._higher_order_ops.associative_scan import associative_scan
+
+        def combine(left, right):
+            return left[0] * right[0], left[1] * right[0] + right[1]
+
+        a = torch.rand(4, 1500, 16, device=self.device) * 0.5 + 0.5
+        b = torch.randn(4, 1500, 16, device=self.device)
+        for dim in (-1, 1):
+            torch._dynamo.reset()
+            actual = torch.compile(associative_scan)(combine, (a, b), dim)
+            expected = associative_scan(combine, (a, b), dim, combine_mode="generic")
+            self.assertEqual(actual, expected)
+
 
 @unittest.skipUnless(torch.backends.mps.is_available(), "MPS not available")
 class MPSBasicTestsAOTI(TestCase):
@@ -488,6 +555,22 @@ class MPSBasicTestsAOTI(TestCase):
         dynamic_shapes = {"x": {0: dim0_x}, "y": {0: dim0_x}}
 
         self.check_model(m, inp, dynamic_shapes)
+
+    def test_scan_dynamic(self):
+        class Model(torch.nn.Module):
+            def forward(self, x, y):
+                return (x.exp() * y).cumsum(-1) * 0.5 + y
+
+        x = torch.randn(8, 3000, device="mps")
+        y = torch.randn(8, 3000, device="mps")
+        n = torch.export.Dim("n", min=2, max=4096)
+        ep = torch.export.export(Model(), (x, y), dynamic_shapes=({1: n}, {1: n}))
+        m = torch._inductor.aoti_load_package(
+            torch._inductor.aoti_compile_and_package(ep)
+        )
+        for length in (3000, 1000, 7):
+            args = (x[:, :length].contiguous(), y[:, :length].contiguous())
+            self.assertEqual(m(*args), Model()(*args), atol=1e-4, rtol=1e-4)
 
     def test_dynamic_cat(self):
         class Model(torch.nn.Module):

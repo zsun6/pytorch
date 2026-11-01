@@ -20,9 +20,11 @@ from torch.utils._sympy.functions import Min
 from torch.utils._sympy.printers import CppPrinter, ExprPrinter as ExprPrinter_
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from .. import ir
 from ..utils import ceildiv, get_bounds_index_expr, get_kernel_metadata
 from ..virtualized import ops, OpsWrapper, V
 from .common import (
+    BackendFeature,
     CSEVariable,
     DeferredLine,
     DTYPE_TO_COMPUTATION_DTYPE,
@@ -35,8 +37,10 @@ from .simd import IterationRangesEntry, SIMDKernel, SIMDScheduling
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..ops_handler import ReductionType, StoreMode
-    from ..scheduler import Scheduler, SchedulerNode
+    from ..scheduler import BaseSchedulerNode, Scheduler, SchedulerNode
     from .common import OpVarT
 
 log = logging.getLogger(__name__)
@@ -667,6 +671,11 @@ class MetalKernel(SIMDKernel):
         rnumel = self.features.reduction_numel
         if isinstance(rnumel, sympy.Integer) and rnumel < self.simd_group_size:
             self.max_threadgroup_size = 1
+        # Scans hit a threadgroup barrier on every loop iteration, so threads past the
+        # end of the row must stay in the loop. They load the last element instead, and
+        # while such a loop is open tail_mask guards their stores and accumulations
+        self.is_scan_kernel = self.features.contains_op("scan")
+        self.tail_mask: str | None = None
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return DTYPE_TO_METAL[dtype]
@@ -706,6 +715,8 @@ class MetalKernel(SIMDKernel):
         else:
             raise RuntimeError(f"Unimplemented store mode {mode}")
         if self.inside_reduction:
+            if self.tail_mask:
+                line = f"if ({self.tail_mask}) {line}"
             self.compute.writeline(DeferredLine(name, line))
         else:
             self.stores.writeline(DeferredLine(name, line))
@@ -743,6 +754,17 @@ class MetalKernel(SIMDKernel):
             var_def += f" = {default_value}"
         self.indexing_code.writeline(var_def + self.suffix)
         return var
+
+    def _accumulate(self, line: str) -> None:
+        # Tail lanes repeat the last element, but values derived from a scan differ
+        # per lane (prefix + k * x[-1]), so even min/max/any must skip them
+        if self.tail_mask:
+            self.compute.writeline(f"if ({self.tail_mask}) {{")
+            with self.compute.indent():
+                self.compute.splice(line)
+            self.compute.writeline("}")
+        else:
+            self.compute.splice(line)
 
     def reduction(
         self,
@@ -824,13 +846,7 @@ class MetalKernel(SIMDKernel):
             self.indexing_code.writeline(
                 "threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
             )
-            self.compute.splice(
-                f"""
-                if ({value}) {{
-                    {acc} = true;
-                }}
-            """
-            )
+            self._accumulate(f"if ({value}) {acc} = true;")
             self.stores.writeline(
                 "threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
             )
@@ -850,7 +866,7 @@ class MetalKernel(SIMDKernel):
                 val = self._new_idxvar(
                     acc_dtype, default_value=default_val, is_threadgroup=False
                 )
-                self.compute.splice(f"{val} {reduction_op}= {value};")
+                self._accumulate(f"{val} {reduction_op}= {value};")
 
             return self.cse.generate(
                 self.stores,
@@ -871,7 +887,7 @@ class MetalKernel(SIMDKernel):
                 val = self._new_idxvar(
                     src_dtype, default_value=limit_val, is_threadgroup=False
                 )
-                self.compute.splice(
+                self._accumulate(
                     f"{val} = ::c10::metal::{reduction_type}({val}, {cast_value});"
                 )
             return self.cse.generate(
@@ -903,7 +919,7 @@ class MetalKernel(SIMDKernel):
                 )
                 idx_val = self._new_idxvar(dtype, default_value=0, is_threadgroup=False)  # type: ignore[assignment]
                 idx_var = f"{self.multistage_reduction_entry[0].root.prefix}_linear_idx"
-                self.compute.splice(f"""
+                self._accumulate(f"""
                 if (::c10::metal::{op_struct}<{src_metal_type}>::replace({cast_value}, {val})) {{
                     {val} = {cast_value};
                     {idx_val} = {logical_idx or idx_var};
@@ -936,7 +952,7 @@ class MetalKernel(SIMDKernel):
             )
             acc_thread_var = f"{acc_buf}[{reduction_idx}]"
             self.indexing_code.splice(f"{acc_thread_var} = 0.0;")
-            self.compute.writeline(
+            self._accumulate(
                 f"{acc_thread_var} = ::c10::metal::welford_combine({acc_thread_var}, float3({value}, 0.0, 1.0));"
             )
             wf_res = self.cse.generate(
@@ -958,7 +974,7 @@ class MetalKernel(SIMDKernel):
             self.indexing_code.splice(f"{acc_thread_var} = 0.0;")
             if self.multistage_reduction_entry:
                 self.indexing_code.splice(f"{acc_thread_var} = 0.0;")
-                self.compute.writeline(
+                self._accumulate(
                     f"{acc_thread_var} = ::c10::metal::welford_combine({acc_thread_var}, {inp_value});"
                 )
             else:
@@ -973,7 +989,148 @@ class MetalKernel(SIMDKernel):
             return _unwrap_helper(wf_res)
         raise NotImplementedError(reduction_type)
 
+    def _simd_shuffle_up(self, value: CSEVariable, delta: int) -> CSEVariable:
+        # Metal simd shuffles have no 64-bit integer or bool overloads
+        if value.dtype is None:
+            raise AssertionError(f"expected dtype on {value}")
+        if value.dtype in (torch.int64, torch.uint64):
+            metal_type = DTYPE_TO_METAL[value.dtype]
+            vec_type = "int2" if value.dtype == torch.int64 else "uint2"
+            line = f"as_type<{metal_type}>(metal::simd_shuffle_up(as_type<{vec_type}>({value}), {delta}))"
+        elif value.dtype == torch.bool:
+            line = f"static_cast<bool>(metal::simd_shuffle_up(static_cast<ushort>({value}), {delta}))"
+        else:
+            line = f"metal::simd_shuffle_up({value}, {delta})"
+        return self.cse.generate(self.compute, line, dtype=value.dtype)
+
+    def scan(
+        self,
+        dtypes: tuple[torch.dtype, ...],
+        combine_fn: Callable[
+            [tuple[CSEVariable, ...], tuple[CSEVariable, ...]], tuple[CSEVariable, ...]
+        ],
+        values: tuple[CSEVariable, ...],
+    ) -> tuple[CSEVariable, ...]:
+        """Inclusive scan along the reduction dim, one threadgroup per row.
+
+        Each simdgroup scans its lanes with shuffles, simdgroup 0 scans the
+        simdgroup totals in threadgroup memory, and rows longer than the
+        threadgroup are scanned chunk by chunk, carrying the total of the
+        previous chunks. combine_fn is inlined at every step.
+        """
+        if not self.inside_reduction:
+            raise AssertionError("expected to be inside reduction")
+        if self._load_mask:
+            raise AssertionError("ops.scan not supported inside ops.masked")
+        rtrees = [t for t in self.range_trees if t.is_reduction]
+        if len(rtrees) != 1:
+            raise NotImplementedError("MPS scans over tiled reduction dims")
+        rtree = rtrees[0]
+        # The scan dim loop must be open even if no input indexes it
+        rtree.full_range().codegen()
+
+        cache_keys = [
+            f"scan({combine_fn!r}, {', '.join(map(str, values))})[{i}]"
+            for i in range(len(values))
+        ]
+        if all(self.cse.contains(key) for key in cache_keys):
+            return tuple(self.cse.get(key) for key in cache_keys)
+
+        dtypes = tuple(DTYPE_TO_COMPUTATION_DTYPE[dtype] for dtype in dtypes)
+
+        def cse_compute(line: str, dtype: torch.dtype) -> CSEVariable:
+            return self.cse.generate(self.compute, line, dtype=dtype)
+
+        def select(
+            cond: str, a: tuple[CSEVariable, ...], b: tuple[CSEVariable, ...]
+        ) -> tuple[CSEVariable, ...]:
+            return tuple(
+                cse_compute(f"{cond} ? static_cast<{DTYPE_TO_METAL[t]}>({x}) : {y}", t)
+                for x, y, t in zip(a, b, dtypes)
+            )
+
+        result = tuple(
+            cse_compute(f"static_cast<{DTYPE_TO_METAL[t]}>({v})", t)
+            for v, t in zip(values, dtypes)
+        )
+        prefixes = None
+        if self.max_threadgroup_size > 1:
+            lane = self.cse.generate(
+                self.indexing_code,
+                f"static_cast<ushort>({rtree.name} % {self.simd_group_size})",
+                dtype=torch.uint16,
+            )
+            simd_id = self.cse.generate(
+                self.indexing_code,
+                f"static_cast<ushort>({rtree.name} / {self.simd_group_size})",
+                dtype=torch.uint16,
+            )
+
+            def simd_scan(xs: tuple[CSEVariable, ...]) -> tuple[CSEVariable, ...]:
+                delta = 1
+                while delta < self.simd_group_size:
+                    ys = tuple(self._simd_shuffle_up(x, delta) for x in xs)
+                    xs = select(f"{lane} >= {delta}", combine_fn(ys, xs), xs)
+                    delta *= 2
+                return xs
+
+            result = simd_scan(result)
+            if not (
+                isinstance(rtree.numel, sympy.Integer)
+                and rtree.numel <= self.simd_group_size
+            ):
+                # Simdgroup totals are scanned by simdgroup 0, the only one that is always full
+                totals = [self._new_idxvar(t, self.simd_group_size) for t in dtypes]
+                prefixes = [self._new_idxvar(t, self.simd_group_size) for t in dtypes]
+                barrier = "threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
+                for total, x in zip(totals, result):
+                    self.compute.writeline(
+                        f"if ({lane} == {self.simd_group_size - 1}) {total}[{simd_id}] = {x};"
+                    )
+                self.compute.writeline(barrier)
+                scanned_totals = simd_scan(
+                    tuple(
+                        cse_compute(f"{total}[{lane}]", t)
+                        for total, t in zip(totals, dtypes)
+                    )
+                )
+                for prefix, x in zip(prefixes, scanned_totals):
+                    self.compute.writeline(
+                        f"if ({simd_id} == 0) {prefix}[{lane}] = {x};"
+                    )
+                self.compute.writeline(barrier)
+                prev_prefix = tuple(
+                    cse_compute(f"{prefix}[{simd_id} > 0 ? {simd_id} - 1 : 0]", t)
+                    for prefix, t in zip(prefixes, dtypes)
+                )
+                result = select(
+                    f"{simd_id} > 0", combine_fn(prev_prefix, result), result
+                )
+
+        if self.multistage_reduction_entry:
+            # A next chunk only exists when this one fills the threadgroup
+            chunk_total = (
+                result
+                if prefixes is None
+                else tuple(
+                    cse_compute(f"{prefix}[{self.simd_group_size - 1}]", t)
+                    for prefix, t in zip(prefixes, dtypes)
+                )
+            )
+            # Only read after the first chunk, so it needs no identity value
+            carry = tuple(self._new_idxvar(t, is_threadgroup=False) for t in dtypes)
+            not_first = f"{rtree.prefix}_cnt > 0"
+            next_carry = select(not_first, combine_fn(carry, chunk_total), chunk_total)
+            result = select(not_first, combine_fn(carry, result), result)
+            for c, x in zip(carry, next_carry):
+                self.compute.writeline(f"{c} = {x};")
+
+        for key, var in zip(cache_keys, result):
+            self.cse.put(key, var)
+        return result
+
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry) -> None:
+        """Define an index variable, opening a loop for reductions over more than a threadgroup"""
         index_expr = self.rename_indexing(entry.expr)
         index_str = self.sexpr(index_expr)  # type: ignore[misc]
 
@@ -1017,7 +1174,8 @@ class MetalKernel(SIMDKernel):
                 f"for(auto {entry.root.prefix}_cnt = 0; {entry.root.prefix}_cnt < {loop_size_str}; ++{entry.root.prefix}_cnt) {{"
             )
             with self.body.indent():
-                if isinstance(acc_size, sympy.Symbol):
+                # Scans need the threadgroup to cover a contiguous chunk on every iteration
+                if isinstance(acc_size, sympy.Symbol) or self.is_scan_kernel:
                     self.body.writeline(
                         f"{self.index_dtype} {linear_idx_name} = "
                         f"{self.max_threadgroup_size} * {entry.root.prefix}_cnt + {root_name};"
@@ -1032,7 +1190,18 @@ class MetalKernel(SIMDKernel):
                     isinstance(acc_size, sympy.Symbol)
                     or loop_size * self.max_threadgroup_size != acc_size
                 ):
-                    self.body.writeline(f"if ({linear_idx_name} >= {acc_size}) break;")
+                    if self.is_scan_kernel:
+                        self.tail_mask = f"{entry.root.prefix}_valid"
+                        self.body.writeline(
+                            f"bool {self.tail_mask} = {linear_idx_name} < {acc_size};"
+                        )
+                        self.body.writeline(
+                            f"{linear_idx_name} = {self.tail_mask} ? {linear_idx_name} : {acc_size} - 1;"
+                        )
+                    else:
+                        self.body.writeline(
+                            f"if ({linear_idx_name} >= {acc_size}) break;"
+                        )
 
                 # Compute entry value from linear index by substituting root name
                 sub_index_str = index_str.replace(entry.root.name, linear_idx_name)
@@ -1076,6 +1245,7 @@ class MetalKernel(SIMDKernel):
             # And loop codegen
             roots = [e.root for e in self.multistage_reduction_entry]
             self.multistage_reduction_entry.clear()
+            self.tail_mask = None
             for node in self.range_tree_nodes.values():
                 if any(node.root is r for r in roots):
                     node.cache_clear()
@@ -1343,6 +1513,34 @@ class MetalScheduling(SIMDScheduling):
 
     def __init__(self, scheduler: Scheduler | None) -> None:
         super().__init__(scheduler)
+
+    @classmethod
+    def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
+        return OrderedSet([BackendFeature.SCAN, BackendFeature.TUPLE_REDUCTION])
+
+    def can_fuse(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        # Looped scan kernels give each thread a strided set of indices, but
+        # threadgroup_argmax/argmin break ties by thread, so they would no longer
+        # return the first index of the extreme value
+        bodies = [
+            n.node.data
+            for n in (*node1.get_nodes(), *node2.get_nodes())
+            if isinstance(n.node, ir.ComputedBuffer)
+        ]
+        if any(isinstance(d, ir.Scan) for d in bodies) and any(
+            isinstance(d, ir.Reduction) and d.reduction_type in ("argmax", "argmin")
+            for d in bodies
+        ):
+            rnumel = (node1 if node1.is_reduction() else node2).group[1][1]
+            if not (
+                isinstance(rnumel, sympy.Integer)
+                and rnumel <= MetalKernel.max_threadgroup_size
+            ):
+                return False
+        return super().can_fuse(node1, node2)
+
+    can_fuse_vertical = can_fuse
+    can_fuse_horizontal = can_fuse
 
     def define_kernel(
         self, src_code: str, node_schedule: list[SchedulerNode], kernel: MetalKernel

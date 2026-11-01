@@ -169,7 +169,7 @@ def associative_scan(
 
     With ``combine_mode="pointwise"``, efficient execution requires runtime code
     generation via ``torch.compile``, and codegen is only supported on backends
-    with scan support (currently CUDA and XPU). On other devices the operator
+    with scan support (currently CUDA, XPU and MPS). On other devices the operator
     still runs eagerly via the generic fallback.
 
     Args:
@@ -186,7 +186,7 @@ def associative_scan(
         combine_mode (str): A string indicating whether the ``combine_fn`` is ``pointwise`` or ``generic``, default ``pointwise``.
             If ``combine_mode=pointwise``, ``combine_fn`` must be pure and may only contain pointwise
             operations; under ``torch.compile`` ``xs`` must be on a backend with scan codegen support
-            (CUDA or XPU), otherwise the generic fallback is used.
+            (CUDA, XPU or MPS), otherwise the generic fallback is used.
             In all other cases ``combine_mode=generic`` should be used.
             Note: ``combine_mode=pointwise`` is more efficient than ``combine_mode=generic``.
             If gradients are required, ``combine_mode=pointwise`` uses the generic

@@ -3122,6 +3122,12 @@ class Scan(Loops):
         ):
             return [None] * len(dtypes)
 
+        # A generated MPS scan is a row-per-threadgroup block scan, slower than the
+        # tuned aten Metal kernel unless it saves memory passes by fusing. When the
+        # scan reads a graph input and feeds only graph outputs there is nothing to fuse
+        if can_fallback_to_aten and device.type == "mps" and _scan_fuses_nothing():
+            return [None] * len(dtypes)
+
         sizevars = V.graph.sizevars
         scan_numel = sizevars.simplify(sympy_product(scan_ranges))
 
@@ -3152,7 +3158,8 @@ class Scan(Loops):
         )
         scan_type = Scan
         if num_splits > 1:
-            triton_supports_split = (
+            # SplitScan is only implemented for Triton
+            triton_supports_split = is_triton(device) and (
                 # pyrefly: ignore [unsupported-operation]
                 torch.version.hip is None or (has_triton and triton_version >= "3.3.0")
             )
@@ -3229,6 +3236,24 @@ class Scan(Loops):
             reduction_type="scan",
             reduction_numel=scan_numel,
         )
+
+
+def _scan_fuses_nothing() -> bool:
+    """Whether the FX node being lowered reads a graph input and only feeds graph outputs"""
+    node = V.graph.current_node
+    if node is None or not node.args:
+        return False
+    inp = node.args[0]
+    if not (isinstance(inp, torch.fx.Node) and inp.op == "placeholder"):
+        return False
+    users = []
+    for user in node.users:
+        # cummax/cummin return a tuple
+        if user.op == "call_function" and user.target is operator.getitem:
+            users.extend(user.users)
+        else:
+            users.append(user)
+    return all(user.op == "output" for user in users)
 
 
 # This signifies a scan op that should go through TritonSplitScanKernel codegen on CUDA.
